@@ -30,6 +30,12 @@ Parameters
   noise_xy        float  std-dev of position noise per step [m] (default 0.05)
   noise_theta     float  std-dev of heading noise per step [rad] (default 0.05)
   score_rays      int    laser rays sampled per particle for scoring (default 36)
+  ray_step        float  ray-marching step size [m] (default 0.025)
+  hit_sigma       float  scan likelihood sigma [m] (default 0.20)
+  map_frame       str    global map frame (default "map")
+  odom_frame      str    local odometry frame (default "odom")
+  laser_offset_x  float  lidar x offset from base frame [m] (default 0.0)
+  laser_offset_y  float  lidar y offset from base frame [m] (default 0.0)
 """
 
 import math
@@ -41,10 +47,10 @@ import zlib
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Quaternion
-from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Quaternion, TransformStamped
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import LaserScan
-from builtin_interfaces.msg import Time
+import tf2_ros
 
 
 # ── Minimal PNG loader (no external deps) ────────────────────────────────────
@@ -111,6 +117,15 @@ def _wrap(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def _rotate_2d(x: float, y: float, yaw: float) -> tuple[float, float]:
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    return (
+        x * cos_yaw - y * sin_yaw,
+        x * sin_yaw + y * cos_yaw,
+    )
+
+
 # ── MCL node ─────────────────────────────────────────────────────────────────
 
 class MCLNode(Node):
@@ -129,6 +144,12 @@ class MCLNode(Node):
         self.declare_parameter("noise_xy",        0.05)
         self.declare_parameter("noise_theta",     0.05)
         self.declare_parameter("score_rays",      36)
+        self.declare_parameter("ray_step",         0.025)
+        self.declare_parameter("hit_sigma",        0.20)
+        self.declare_parameter("map_frame",       "map")
+        self.declare_parameter("odom_frame",      "odom")
+        self.declare_parameter("laser_offset_x",   0.0)
+        self.declare_parameter("laser_offset_y",   0.0)
 
         self._res      = self.get_parameter("map_resolution").value
         self._orig_x   = self.get_parameter("map_origin_x").value
@@ -138,6 +159,12 @@ class MCLNode(Node):
         self._noise_xy = self.get_parameter("noise_xy").value
         self._noise_th = self.get_parameter("noise_theta").value
         self._n_rays   = self.get_parameter("score_rays").value
+        self._ray_step = self.get_parameter("ray_step").value
+        self._hit_sigma = self.get_parameter("hit_sigma").value
+        self._map_frame = self.get_parameter("map_frame").value
+        self._odom_frame = self.get_parameter("odom_frame").value
+        self._laser_offset_x = self.get_parameter("laser_offset_x").value
+        self._laser_offset_y = self.get_parameter("laser_offset_y").value
 
         # ── Load map ──────────────────────────────────────────────────────
         map_path = self.get_parameter("map_path").value
@@ -159,7 +186,6 @@ class MCLNode(Node):
         # ── State ─────────────────────────────────────────────────────────
         self._particles: list[list[float]] = []   # each: [x, y, theta]
         self._prev_odom: Odometry | None   = None
-        self._last_scan: LaserScan | None  = None
 
         # Initialise with uniform sample (step D)
         self._initialise_particles()
@@ -173,6 +199,7 @@ class MCLNode(Node):
                                                     durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
                                                     reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
                                                 ))
+        self._tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # Re-publish map every 3 s for the first 30 s so RViz always gets it
         self._map_timer_count = 0
@@ -201,7 +228,7 @@ class MCLNode(Node):
         # stamp 0 = always valid in RViz regardless of sim/wall time
         grid.header.stamp.sec  = 0
         grid.header.stamp.nanosec = 0
-        grid.header.frame_id = "odom"
+        grid.header.frame_id = self._map_frame
 
         grid.info.resolution = self._res
         grid.info.width      = self._map_w
@@ -259,14 +286,28 @@ class MCLNode(Node):
             return self._map[row * self._map_w + col]
         return 0
 
+    def _expected_range(self, sx: float, sy: float, angle: float,
+                        range_min: float, range_max: float) -> float:
+        """
+        March a synthetic ray through the occupancy map until it hits an
+        occupied cell. If nothing is hit, fall back to range_max.
+        """
+        distance = max(range_min, self._ray_step)
+        while distance <= range_max:
+            wx = sx + distance * math.cos(angle)
+            wy = sy + distance * math.sin(angle)
+            if self._map_value(wx, wy) <= 127:
+                return distance
+            distance += self._ray_step
+        return range_max
+
     # ── E. Scoring ────────────────────────────────────────────────────────
 
     def _score_particle(self, px: float, py: float, pth: float,
                         scan: LaserScan) -> float:
         """
-        Score = sum over sampled rays of (255 - pixel_at_hit_point).
-        A wall pixel (0) contributes 255; free pixel (255) contributes 0.
-        High score → particle pose explains the observed walls well.
+        Score = sum of Gaussian likelihoods comparing measured ranges to
+        expected map ranges from the particle pose.
         """
         total_rays = len(scan.ranges)
         if total_rays == 0:
@@ -274,15 +315,27 @@ class MCLNode(Node):
 
         step = max(1, total_rays // self._n_rays)
         score = 0.0
+        sensor_dx, sensor_dy = _rotate_2d(
+            self._laser_offset_x, self._laser_offset_y, pth
+        )
+        sensor_x = px + sensor_dx
+        sensor_y = py + sensor_dy
 
         for i in range(0, total_rays, step):
             r = scan.ranges[i]
             if not math.isfinite(r):
                 continue
+            if r < scan.range_min or r > scan.range_max:
+                continue
+
             angle = scan.angle_min + i * scan.angle_increment + pth
-            hx = px + r * math.cos(angle)
-            hy = py + r * math.sin(angle)
-            score += 255 - self._map_value(hx, hy)
+            expected = self._expected_range(
+                sensor_x, sensor_y, angle, scan.range_min, scan.range_max
+            )
+            error = r - expected
+            score += math.exp(
+                -0.5 * (error / self._hit_sigma) * (error / self._hit_sigma)
+            )
 
         return score
 
@@ -317,6 +370,33 @@ class MCLNode(Node):
             p[0] += dx_r * cos_p - dy_r * sin_p + random.gauss(0.0, self._noise_xy)
             p[1] += dx_r * sin_p + dy_r * cos_p + random.gauss(0.0, self._noise_xy)
             p[2]  = _wrap(p[2] + dth + random.gauss(0.0, self._noise_th))
+
+    def _broadcast_map_to_odom(self, best_pose: list[float], stamp):
+        """
+        Publish the correction between the estimated robot pose in map and the
+        dead-reckoned pose in odom.
+        """
+        if self._prev_odom is None:
+            return
+
+        odom_x = self._prev_odom.pose.pose.position.x
+        odom_y = self._prev_odom.pose.pose.position.y
+        odom_yaw = _yaw_from_quaternion(self._prev_odom.pose.pose.orientation)
+
+        map_to_odom_yaw = _wrap(best_pose[2] - odom_yaw)
+        rot_x, rot_y = _rotate_2d(odom_x, odom_y, map_to_odom_yaw)
+        map_to_odom_x = best_pose[0] - rot_x
+        map_to_odom_y = best_pose[1] - rot_y
+
+        tf = TransformStamped()
+        tf.header.stamp = stamp
+        tf.header.frame_id = self._map_frame
+        tf.child_frame_id = self._odom_frame
+        tf.transform.translation.x = map_to_odom_x
+        tf.transform.translation.y = map_to_odom_y
+        tf.transform.translation.z = 0.0
+        tf.transform.rotation = _quaternion_from_yaw(map_to_odom_yaw)
+        self._tf_broadcaster.sendTransform(tf)
 
     # ── Callbacks ─────────────────────────────────────────────────────────
 
@@ -353,14 +433,16 @@ class MCLNode(Node):
         # Publish
         stamp = scan.header.stamp
         self._publish_particles(stamp)
-        self._publish_best_pose(survivors, stamp)
+        best_pose = self._publish_best_pose(survivors, stamp)
+        if best_pose is not None:
+            self._broadcast_map_to_odom(best_pose, stamp)
 
     # ── Publishing ────────────────────────────────────────────────────────
 
     def _publish_particles(self, stamp):
         msg = PoseArray()
         msg.header.stamp    = stamp
-        msg.header.frame_id = "odom"
+        msg.header.frame_id = self._map_frame
 
         for p in self._particles:
             pose = Pose()
@@ -374,7 +456,7 @@ class MCLNode(Node):
     def _publish_best_pose(self, survivors: list[list[float]], stamp):
         """Publish the mean of the top-K survivors as the best pose estimate."""
         if not survivors:
-            return
+            return None
 
         mean_x = sum(p[0] for p in survivors) / len(survivors)
         mean_y = sum(p[1] for p in survivors) / len(survivors)
@@ -386,12 +468,13 @@ class MCLNode(Node):
 
         msg = PoseStamped()
         msg.header.stamp    = stamp
-        msg.header.frame_id = "odom"
+        msg.header.frame_id = self._map_frame
         msg.pose.position.x  = mean_x
         msg.pose.position.y  = mean_y
         msg.pose.orientation = _quaternion_from_yaw(mean_th)
 
         self._pub_pose.publish(msg)
+        return [mean_x, mean_y, mean_th]
 
 
 def main(args=None):
