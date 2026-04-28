@@ -1,0 +1,36 @@
+# ros_gz_bridge parameter bridge configuration
+# Each entry maps a Gazebo topic <-> ROS2 topic
+# direction: GZ_TO_ROS, ROS_TO_GZ, or BIDIRECTIONAL
+#
+# Topic naming convention:
+#   gz topics use the model-scoped name from the plugin
+#   ros topics use the flat /topic_name convention
+
+# /cmd_vel: ROS2 Twist → Gazebo (teleop drives the sim)
+- ros_topic_name: "/cmd_vel"
+  gz_topic_name: "/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ
+
+# /clock: Gazebo sim time → ROS2 (use_sim_time support)
+- ros_topic_name: "/clock"
+  gz_topic_name: "/clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "gz.msgs.Clock"
+  direction: GZ_TO_ROS
+
+# /joint_states: wheel joint positions+velocities → ROS2
+# Used by robot_state_publisher for TF and by dead_reckoning for encoder data
+- ros_topic_name: "/joint_states"
+  gz_topic_name: "/joint_states"
+  ros_type_name: "sensor_msgs/msg/JointState"
+  gz_type_name: "gz.msgs.Model"
+  direction: GZ_TO_ROS
+
+# /scan: LiDAR → ROS2
+- ros_topic_name: "/scan"
+  gz_topic_name: "/scan"
+  ros_type_name: "sensor_msgs/msg/LaserScan"
+  gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
