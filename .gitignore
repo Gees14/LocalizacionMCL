@@ -1,0 +1,18 @@
+# ROS 2 / colcon generated output
+build/
+install/
+log/
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Local editor / assistant workspace files
+.claude/
+.codex
+.vscode/
+
+# OS cruft
+.DS_Store
