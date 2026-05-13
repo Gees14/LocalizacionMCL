@@ -22,14 +22,15 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='jesus',
-    maintainer_email='chat4Claude@outlook.com',
-    description='Control nodes for Puzzlebot',
+    maintainer='Jorge Reyes',
+    maintainer_email='rpz.dar14@gmail.com',
+    description='Localization and odometry nodes for the Puzzlebot (MCL)',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'dead_reckoning = puzzlebot_control.dead_reckoning:main',
-            'mcl = puzzlebot_control.mcl:main',
+            'wheel_odometry    = puzzlebot_control.wheel_odometry:main',
+            'localization_node = puzzlebot_control.localization_node:main',
+            'maze_builder      = puzzlebot_control.maze_builder:main',
         ],
     },
 )

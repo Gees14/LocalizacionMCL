@@ -113,18 +113,19 @@ def generate_launch_description():
         ],
     )
 
-    # ── 5. dead_reckoning ─────────────────────────────────────────────
-    dead_reckoning = Node(
+    # ── 5. Wheel odometry ─────────────────────────────────────────────
+    wheel_odometry = Node(
         package='puzzlebot_control',
-        executable='dead_reckoning',
-        name='dead_reckoning',
+        executable='wheel_odometry',
+        name='wheel_odometry_node',
         output='screen',
         parameters=[{
-            'use_sim_time': True,
-            'wheel_radius': 0.05,
+            'use_sim_time':     True,
+            'wheel_radius':     0.05,
             'wheel_separation': 0.19,
-            'odom_frame': 'odom',
-            'base_frame': 'base_footprint',
+            'odom_frame':       'odom',
+            'base_frame':       'base_footprint',
+            'input_source':     'joint_states',
         }],
         remappings=[
             ('/joint_states', '/world/flat_plane/model/puzzlebot/joint_state'),
@@ -149,6 +150,6 @@ def generate_launch_description():
         rsp,
         bridge,
         spawn,
-        dead_reckoning,
+        wheel_odometry,
         rviz,
     ])

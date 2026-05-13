@@ -1,93 +1,116 @@
-# Puzzlebot ROS 2 + Gazebo Workspace
+# Puzzlebot — Monte Carlo Localization
 
-This workspace contains a Puzzlebot simulation and localization stack built on:
+ROS 2 Humble workspace that implements **Monte Carlo Localization (MCL)** for the
+Puzzlebot differential-drive robot, simulated in Gazebo Fortress.
 
-- ROS 2 Humble
-- Gazebo Fortress (`ign gazebo`, `ignition-gazebo 6`)
-- `ros_gz_bridge` for ROS 2 <-> Gazebo transport bridging
+**Author:** Jorge Reyes — `rpz.dar14@gmail.com`
 
-The repository is split into three packages:
+---
 
-- `src/puzzlebot_description`: robot meshes, URDF, and base RViz config
-- `src/puzzlebot_gz`: Gazebo world files, simulation launch files, SDF model, and MCL RViz config
-- `src/puzzlebot_control`: dead reckoning and Monte Carlo localization nodes
+## Stack
 
-## Important note
+| Layer | Version |
+|-------|---------|
+| ROS 2 | Humble |
+| Gazebo | Fortress (ignition-gazebo 6) |
+| Bridge | ros-humble-ros-gz (ignition.msgs) |
 
-This workspace is configured for the Fortress-era bridge described in
-[INTEGRATION.md](/home/jesus/Documents/pzGz_ws/INTEGRATION.md). Do not mix the
-Fortress bridge with Harmonic `gz sim` binaries or `gz.msgs.*` topic types.
+---
+
+## Package layout
+
+```
+src/
+├── puzzlebot_description/   # URDF, meshes, RViz configs
+├── puzzlebot_gz/            # SDF worlds, launch files
+└── puzzlebot_control/       # Algorithm nodes
+    └── puzzlebot_control/
+        ├── map_loader.py        — PNG occupancy map + ray casting
+        ├── particle_filter.py   — MCL particle filter (pure Python, no ROS)
+        ├── localization_node.py — ROS 2 node: /odom + /scan → /localization/*
+        ├── wheel_odometry.py    — Differential-drive odometry node
+        └── maze_builder.py      — Generates maze_map.png from geometry
+```
+
+---
 
 ## Build
 
 ```bash
-source /opt/ros/humble/setup.bash
-cd ~/Documents/pzGz_ws
-colcon build
+cd ~/pzGz_ws
+colcon build --symlink-install
 source install/setup.bash
 ```
 
-## Run the flat simulation
+---
+
+## Run
+
+### Flat-plane simulation (odometry only)
 
 ```bash
 ros2 launch puzzlebot_gz sim.launch.py
 ```
 
-Teleop from a second terminal:
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/Documents/pzGz_ws/install/setup.bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard \
-  --ros-args --remap cmd_vel:=/model/puzzlebot/cmd_vel
-```
-
-## Run the maze + MCL demo
+### MCL in the maze world
 
 ```bash
 ros2 launch puzzlebot_gz mcl.launch.py
 ```
 
-This launch file starts:
+### Teleop (separate terminal)
 
-- the maze world
-- the Fortress bridge
-- `robot_state_publisher`
-- the dead-reckoning odometry node
-- the MCL node
-- RViz with the localization layout
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+  --ros-args --remap cmd_vel:=/model/puzzlebot/cmd_vel
+```
 
-## Reading the MCL RViz view
+---
 
-- `Map (MCL)`: occupancy map used by the filter
-- `LaserScan (raw)`: current LiDAR hits
-- `MCL Particles`: particle cloud
-- `MCL Best Pose`: mean pose of the strongest particles
-- `Odometry (dead reckoning)`: raw odom path before MCL correction
+## Topics published by the localization node
 
-For localization checks, use `map` as the RViz fixed frame. In `map` frame, the
-scan should stay aligned with walls and obstacles while driving. In `odom`
-frame, the map may appear to rotate or shift as MCL corrects odometry drift.
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/localization/particles` | `geometry_msgs/PoseArray` | Full particle cloud |
+| `/localization/pose` | `geometry_msgs/PoseStamped` | Weighted mean estimate |
+| `/localization/map` | `nav_msgs/OccupancyGrid` | Static occupancy map |
+| `/odom` | `nav_msgs/Odometry` | Wheel odometry |
 
-## Current MCL behavior
+TF tree: `map → odom → base_footprint`
 
-The MCL node currently:
+---
 
-- samples particles uniformly in free space
-- moves particles with dead-reckoning odometry
-- scores particles by comparing measured ranges against ray-marched expected
-  ranges from the occupancy map
-- publishes a `map -> odom` correction transform
+## RViz displays
 
-Relevant files:
+Add these displays in RViz after launching `mcl.launch.py`:
 
-- [src/puzzlebot_control/puzzlebot_control/mcl.py](/home/jesus/Documents/pzGz_ws/src/puzzlebot_control/puzzlebot_control/mcl.py)
-- [src/puzzlebot_control/puzzlebot_control/dead_reckoning.py](/home/jesus/Documents/pzGz_ws/src/puzzlebot_control/puzzlebot_control/dead_reckoning.py)
-- [src/puzzlebot_gz/launch/mcl.launch.py](/home/jesus/Documents/pzGz_ws/src/puzzlebot_gz/launch/mcl.launch.py)
-- [src/puzzlebot_gz/rviz/mcl_rviz.rviz](/home/jesus/Documents/pzGz_ws/src/puzzlebot_gz/rviz/mcl_rviz.rviz)
+| Display | Topic / Frame |
+|---------|---------------|
+| PoseArray | `/localization/particles` |
+| PoseStamped | `/localization/pose` |
+| Map | `/localization/map` |
+| Odometry | `/odom` |
+| LaserScan | `/scan` |
+| TF | — |
 
-## More detail
+---
 
-For the full integration rationale, troubleshooting notes, bridge details, and
-Gazebo/ROS 2 version constraints, read
-[INTEGRATION.md](/home/jesus/Documents/pzGz_ws/INTEGRATION.md).
+## Regenerate the map
+
+If you change the maze geometry in `maze_builder.py`, regenerate the PNG:
+
+```bash
+ros2 run puzzlebot_control maze_builder
+```
+
+---
+
+## Algorithm overview
+
+1. **Seed** — N particles placed uniformly in free space
+2. **Predict** — each particle moved by odometry delta + Gaussian noise (motion model)
+3. **Update** — each particle scored via Gaussian beam likelihood against laser scan (sensor model)
+4. **Resample** — top-K survivors cloned back to N with small perturbation
+5. **Estimate** — weighted circular mean of all particles
+
+See `src/puzzlebot_control/puzzlebot_control/particle_filter.py` for the implementation.
